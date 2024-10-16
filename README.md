@@ -3,9 +3,10 @@
 This repository contains code for VR teleoperation of an xArm6 robot using just an HTC Vive Controller. It uses the OpenVR API to access controller data. Joint angles are calculated to match the robot end-effector pose to the controller pose. The joint angles are applied to xArm6 using a [custom wrapper](https://github.com/ExistentialRobotics/erl_xArm) over the xArm Python SDK.
 
 ## Setup
-1. Basic Steam setup for Vive with Ubuntu: SteamVR + OpenVR
+1. Basic Steam setup for Vive with Ubuntu: SteamVR
       - https://github.com/ankurhanda/HTC-Vive-Setup-Ubuntu
-      - Do not need to follow entire instructions from here as we are aiming for a headset-free setup 
+      - Do not need to follow entire instructions from here as we are aiming for a headset-free setup
+      - No need to install OpenVR from source as per this page. pip install is enough.  
 
 2. SteamVR setup for headset-free operation
       - https://github.com/username223/SteamVRNoHeadset

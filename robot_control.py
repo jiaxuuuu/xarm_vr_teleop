@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 # For custom wrapper over xArm6 Python API
 # export PYTHONPATH=$PYTHONPATH:/home/erl-tianyu/dwait_local_repo/erl_xArm/
 import sys
-sys.path.append("/home/erl-tianyu/dwait_local_repo/erl_xArm/")
+sys.path.append("/home/erl-xarm6/dwait_ws/erl_xArm/")
 from devices.xarm6 import XArmControl
 
 
@@ -48,7 +48,7 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
 
     pose_matrix = controller.get_pose_matrix()
     if pose_matrix is None:
-        return None, None
+        return None, None, None, None
     
     if dummy_ori:
         rpy = np.array([np.pi, 0, 0])
@@ -91,15 +91,18 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
             PID_rel_vr_position = Kp_pos * rel_vr_pos_error + Ki_pos * error_I
             # prev_rel_eef_pos = PID_rel_vr_position
 
-        # For safety, using 0.5 times the VR controller's motion for the target eef position.
-        eef_target_pos_PID = init_eef_pos + PID_rel_vr_position * 0.5
+            # For safety, using 0.5 times the VR controller's motion for the target eef position.
+            eef_target_pos_PID = init_eef_pos + PID_rel_vr_position * 0.5
+            desired_eef_pos = eef_target_pos_PID
+        else:
+            desired_eef_pos = init_eef_pos + rel_vr_pos * 0.5
 
         Kp_jang =  0.1
         Ki_jang =  0.4 * 16
         PID_jang = None
         jang_code = 0
         if use_jang_pid:    
-            jang_code, target_jang = xarm.arm.get_inverse_kinematics(np.concatenate([eef_target_pos_PID*1000, rpy]), input_is_radian=True, return_is_radian=True)
+            jang_code, target_jang = xarm.arm.get_inverse_kinematics(np.concatenate([desired_eef_pos*1000, rpy]), input_is_radian=True, return_is_radian=True)
             if jang_code == 0:
                 curr_jang_error = target_jang - prev_actual_robot_jang
                 jang_error_sum += curr_jang_error
@@ -110,7 +113,7 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
             else:
                 print(f"IK failed, code: {jang_code}")
                     
-    return eef_target_pos_PID, rpy, PID_jang, jang_code
+    return desired_eef_pos, rpy, PID_jang, jang_code
 
 
 def recover_from_failure(start_pos, end_pos, maintain_rpy, use_position_pid):
@@ -172,7 +175,7 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
     recover_ikfail_from_pos = None
     recover_oob_from_pos = None
     gripper_closed = False
-    rel_pos = None
+    eef_pos_target = None
     
     fetch_init_poses()
     prev_actual_robot_jang = np.array(init_jangs)
@@ -180,31 +183,31 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
     while True:
         loop_start_time = time.time()
 
-        if not (rel_pos is None):
-            prev_valid_pos = rel_pos
-        rel_pos, rpy, PID_jang, jang_code = get_eef_target_pos_ori(dummy_ori=False, rpy_mask=[0,0,1], use_position_pid=use_position_pid, use_jang_pid=use_jang_pid)
-        if rel_pos is None:
+        if not (eef_pos_target is None):
+            prev_valid_pos = eef_pos_target
+        eef_pos_target, rpy, PID_jang, jang_code = get_eef_target_pos_ori(dummy_ori=False, rpy_mask=[1,0,1], use_position_pid=use_position_pid, use_jang_pid=use_jang_pid)
+        if eef_pos_target is None:
             controller.trigger_haptic_pulse()
             recover_oob_from_pos = prev_valid_pos
             continue
-        if recover_oob_from_pos is not None and np.linalg.norm(rel_pos-recover_oob_from_pos) > 0.01:
+        if recover_oob_from_pos is not None and np.linalg.norm(eef_pos_target-recover_oob_from_pos) > 0.01:
             # recover_from_failure(recover_oob_from_pos, rel_pos, rpy, use_position_pid)
             # print("Recovered from Out of Bounds failure")
             recover_oob_from_pos = None
             print("\nController traveled too far while out of bounds for detection. Exiting to avoid potentially unsafe situation")
             break
 
-        trajectory.append(rel_pos)
+        trajectory.append(eef_pos_target)
 
         # Setting eef pose with different control modes 
         if control_mode == "eef_pos":
-            xarm.set_eef_position(*rel_pos)
+            xarm.set_eef_position(*eef_pos_target)
 
         elif control_mode == "eef_pose":
-            xarm.set_eef_pose(rel_pos[0], rel_pos[1], rel_pos[2])
+            xarm.set_eef_pose(eef_pos_target[0], eef_pos_target[1], eef_pos_target[2])
 
         elif control_mode == "eef_pose_vel":
-            curr_posori = np.concatenate([rel_pos*1000, rpy])
+            curr_posori = np.concatenate([eef_pos_target*1000, rpy])
             curr_vel =  curr_posori - prev_posori
             prev_posori = curr_posori
             if first:
@@ -220,7 +223,7 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
             curr_jangs = PID_jang
             code = jang_code
         else:
-            code, curr_jangs = xarm.arm.get_inverse_kinematics(np.concatenate([rel_pos*1000, rpy]), input_is_radian=True, return_is_radian=True)
+            code, curr_jangs = xarm.arm.get_inverse_kinematics(np.concatenate([eef_pos_target*1000, rpy]), input_is_radian=True, return_is_radian=True)
         
         if control_mode == "joint_vel":
             if code != 0:
@@ -240,11 +243,11 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
             if code != 0:
                 print(f"IK Failed, skipping")
                 controller.trigger_haptic_pulse()
-                recover_ikfail_from_pos = rel_pos
+                recover_ikfail_from_pos = eef_pos_target
                 continue
 
             if recover_ikfail_from_pos is not None:
-                recover_from_failure(recover_ikfail_from_pos, rel_pos, rpy, use_position_pid)
+                recover_from_failure(recover_ikfail_from_pos, eef_pos_target, rpy, use_position_pid)
                 print("Recovered from IK failure")
                 recover_ikfail_from_pos = None
                 continue
