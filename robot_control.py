@@ -255,18 +255,22 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
         curr_y_axis = curr_ori_in_2[:, 1]  # Controller Y axis
         init_y_axis = init_ori_in_2[:, 1]  # Initial controller Y axis
         
-        # Calculate CHANGE in rotation since last frame (not absolute)
+        # Calculate CHANGE in all rotations since last frame (not absolute)
         if 'prev_controller_ori' not in globals():
             global prev_controller_ori
             prev_controller_ori = curr_ori_in_2
-            y_rotation_change = 0  # No change on first frame
+            controller_rotation_changes = np.array([0, 0, 0])  # No change on first frame
         else:
             # Calculate relative rotation between current and previous frame
             rel_rotation = prev_controller_ori.T @ curr_ori_in_2
             
-            # Extract Y-axis rotation change from rotation matrix
-            # For small rotations, the Y-rotation is approximately the (0,2) element
-            y_rotation_change = np.arctan2(rel_rotation[0, 2], rel_rotation[0, 0])
+            # Extract rotation changes around all three axes (in radians)
+            # For small rotations, we can extract Euler angles from rotation matrix
+            controller_rotation_changes = np.array([
+                np.arctan2(rel_rotation[2, 1], rel_rotation[2, 2]),  # X-axis rotation (roll)
+                np.arctan2(-rel_rotation[2, 0], np.sqrt(rel_rotation[2, 1]**2 + rel_rotation[2, 2]**2)),  # Y-axis rotation (pitch)
+                np.arctan2(rel_rotation[1, 0], rel_rotation[0, 0])   # Z-axis rotation (yaw)
+            ])
             
             # Update previous orientation
             prev_controller_ori = curr_ori_in_2
@@ -282,21 +286,49 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
             # Skip this iteration if we can't read current pose
             return None, None, None, None
         
-        # Controller Y rotation change → TCP yaw change (1:1 mapping, already small)
-        tcp_yaw_change = y_rotation_change  # Direct frame-to-frame change
+        # Map controller rotation changes to TCP local frame rotations
+        # Controller local frame: Y-up (natural grip)
+        # TCP local frame: Z-down (standard tool orientation)
+        # Need to map between these different coordinate systems
         
-        # Apply the change to current TCP orientation
-        rpy = [current_rpy[0],                    # Keep current roll
-               current_rpy[1],                    # Keep current pitch  
-               current_rpy[2] + tcp_yaw_change]   # Add yaw change
+        # Get current TCP rotation matrix to transform rotation commands to TCP local frame
+        import transforms3d as t3d
+        current_tcp_matrix = t3d.euler.euler2mat(current_rpy[0], current_rpy[1], current_rpy[2], 'rxyz')
+        
+        # Transform controller rotation changes from base frame to TCP local frame
+        tcp_local_rotation_changes = current_tcp_matrix.T @ controller_rotation_changes
+        
+        # Map controller coordinate system to TCP coordinate system for intuitive control:
+        # Controller: X=right, Y=up, Z=forward (natural grip)
+        # TCP: X=forward, Y=left, Z=down (standard tool)
+        # Z rotation feels right, but X and Y need sign correction for intuitive control
+        mapped_tcp_changes = np.array([
+            -tcp_local_rotation_changes[2],  # Controller Z (forward) -> TCP X (forward, negated for intuition)
+            tcp_local_rotation_changes[0],   # Controller X (right) -> TCP Y (left, positive for intuition)
+            -tcp_local_rotation_changes[1]   # Controller Y (up) -> TCP Z (down, keep negative - this one feels right)
+        ])
+        
+        # Apply rotation changes in TCP local frame then convert back to base frame RPY
+        rotation_delta_matrix = t3d.euler.euler2mat(mapped_tcp_changes[0], 
+                                                   mapped_tcp_changes[1], 
+                                                   mapped_tcp_changes[2], 'rxyz')
+        
+        # Apply the rotation change to current TCP orientation
+        new_tcp_matrix = current_tcp_matrix @ rotation_delta_matrix
+        
+        # Extract new RPY from the updated rotation matrix
+        rpy = list(t3d.euler.mat2euler(new_tcp_matrix, 'rxyz'))
         
         # Debug
-        if abs(tcp_yaw_change) > 0.001:  # > 0.057 degrees
-            print(f"\n[YAW CHANGE] Controller Y: {y_rotation_change*180/np.pi:.3f}° -> TCP yaw: +{tcp_yaw_change*180/np.pi:.3f}°", end="")
+        if np.linalg.norm(mapped_tcp_changes) > 0.001:  # > 0.057 degrees total
+            changes_deg = mapped_tcp_changes * 180 / np.pi
+            print(f"\n[ORIENTATION] Mapped TCP changes: roll={changes_deg[0]:.3f}°, pitch={changes_deg[1]:.3f}°, yaw={changes_deg[2]:.3f}°", end="")
         
         
         # Debug print
-        print(f"\rController Y change: {y_rotation_change*180/np.pi:.3f}° -> TCP Yaw change: {tcp_yaw_change*180/np.pi:.3f}° | TCP RPY: [{current_rpy[0]*180/np.pi:.0f}°, {current_rpy[1]*180/np.pi:.0f}°, {current_rpy[2]*180/np.pi:.0f}°]", end="")
+        ctrl_changes_deg = controller_rotation_changes * 180 / np.pi
+        mapped_changes_deg = mapped_tcp_changes * 180 / np.pi
+        print(f"\rController XYZ: [{ctrl_changes_deg[0]:.3f}°, {ctrl_changes_deg[1]:.3f}°, {ctrl_changes_deg[2]:.3f}°] -> TCP XYZ: [{mapped_changes_deg[0]:.3f}°, {mapped_changes_deg[1]:.3f}°, {mapped_changes_deg[2]:.3f}°] | TCP RPY: [{current_rpy[0]*180/np.pi:.0f}°, {current_rpy[1]*180/np.pi:.0f}°, {current_rpy[2]*180/np.pi:.0f}°]", end="")
 
     # Apply RPY mask to disable certain rotations if needed
     if not dummy_ori and not rpy_mask[0]:
