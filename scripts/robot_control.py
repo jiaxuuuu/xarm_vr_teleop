@@ -1,4 +1,10 @@
 import numpy as np
+import sys
+import os
+
+# Add parent directory to path to find triad_openvr
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import triad_openvr as vr
 import time
 import transforms3d as t3d
@@ -302,11 +308,16 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
         # Controller: X=right, Y=up, Z=forward (natural grip)
         # TCP: X=forward, Y=left, Z=down (standard tool)
         # Z rotation feels right, but X and Y need sign correction for intuitive control
-        mapped_tcp_changes = np.array([
+        raw_mapped_changes = np.array([
             -tcp_local_rotation_changes[2],  # Controller Z (forward) -> TCP X (forward, negated for intuition)
             tcp_local_rotation_changes[0],   # Controller X (right) -> TCP Y (left, positive for intuition)
             -tcp_local_rotation_changes[1]   # Controller Y (up) -> TCP Z (down, keep negative - this one feels right)
         ])
+        
+        # Apply smooth mapping: use tanh to compress large movements while preserving small ones
+        # This gives natural response for both small precise movements and large gestures
+        max_rotation_per_frame = 0.1  # ~5.7 degrees max per frame
+        mapped_tcp_changes = np.tanh(raw_mapped_changes / max_rotation_per_frame) * max_rotation_per_frame
         
         # Apply rotation changes in TCP local frame then convert back to base frame RPY
         rotation_delta_matrix = t3d.euler.euler2mat(mapped_tcp_changes[0], 
@@ -356,8 +367,10 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
             # Update previous position
             prev_controller_pos = curr_pos_in_2
         
-        # Apply small movement to current TCP position (scale down for safety)
-        tcp_pos_change = controller_pos_change * 0.5  # 50% of controller movement per frame
+        # Apply smooth position mapping: use tanh to compress large movements while preserving small ones
+        max_pos_change_per_frame = 0.01  # 1cm max per frame
+        raw_pos_change = controller_pos_change * 0.8  # Base scaling
+        tcp_pos_change = np.tanh(raw_pos_change / max_pos_change_per_frame) * max_pos_change_per_frame
         desired_eef_pos = current_tcp_pos + tcp_pos_change
         
         # Debug position changes
@@ -616,7 +629,7 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
 if __name__ == "__main__":
     # Control modes: "eef_pos" (position only), "eef_pose" (position + orientation), 
     # "joint_ang", "joint_vel", "eef_pose_vel"
-    xarm_control_mode = "eef_pose"  # Position + orientation mode
+    xarm_control_mode = "eef_pos"  # Position + orientation mode
     simulated = False  # Set to True for simulation
     control_freq = 10  # Much lower frequency to prevent emergency stops
 
