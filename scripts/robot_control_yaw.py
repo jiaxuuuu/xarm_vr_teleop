@@ -8,14 +8,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import triad_openvr as vr
 import time
 import transforms3d as t3d
-from vr_test import get_transforms
+from calibrated_transforms import get_transforms_calibrated as get_transforms
 import matplotlib.pyplot as plt
 
 # Import the official xArm SDK
 from xarm.wrapper import XArmAPI
 
 class XArmControl:
-    def __init__(self, ip, mode=0, simulated=True, tcp_z_offset=145):
+    def __init__(self, ip, mode=0, simulated=True, tcp_z_offset=218):
         self.arm = XArmAPI(ip)
         print(f"Connecting to xArm at {ip}...")
         
@@ -119,9 +119,81 @@ class XArmControl:
         print("Robot state set to READY successfully")
         time.sleep(1.0)
         
+        # Initialize TCP orientation to standard pose
+        self.initialize_tcp_orientation()
+        
         # Print final state
         print("Final robot state:")
         self.print_robot_state()
+        
+    def initialize_tcp_orientation(self):
+        """Initialize robot to standard TCP orientation"""
+        print("\nInitializing TCP orientation...")
+        
+        # Get current position
+        code, current_pos = self.arm.get_position(is_radian=True)
+        if code != 0:
+            print(f"Failed to get current position, code: {code}")
+            return
+        
+        # Set target orientation: roll=3.136, pitch=0.000, yaw=0.000
+        target_orientation = [3.136, 0.000, 0.000]  # [roll, pitch, yaw] in radians
+        
+        # Keep current position, set target orientation
+        target_pose = [current_pos[0], current_pos[1], current_pos[2]] + target_orientation
+        
+        print(f"Moving to initialization pose:")
+        print(f"  Position (mm): x={target_pose[0]:.1f}, y={target_pose[1]:.1f}, z={target_pose[2]:.1f}")
+        print(f"  Orientation (rad): roll={target_pose[3]:.3f}, pitch={target_pose[4]:.3f}, yaw={target_pose[5]:.3f}")
+        
+        # Check if target pose is reachable using inverse kinematics
+        print("Checking if target pose is reachable...")
+        code, joint_angles = self.arm.get_inverse_kinematics(target_pose, input_is_radian=True, return_is_radian=True)
+        if code != 0:
+            print(f"❌ Target pose is not reachable! IK failed with code: {code}")
+            return
+        else:
+            print("✅ Target pose is reachable")
+        
+        # Reset robot state completely before movement to ensure clean state
+        print("Resetting robot state before movement...")
+        self.arm.clean_error()
+        self.arm.clean_warn()
+        time.sleep(1.0)
+        
+        # Re-enable motion and set state
+        self.arm.motion_enable(enable=True)
+        time.sleep(1.0)
+        self.arm.set_mode(0)  # Position mode
+        time.sleep(1.0)
+        self.arm.set_state(state=0)  # Ready state
+        time.sleep(1.0)
+        
+        # Use joint control with very slow movement to avoid emergency stops
+        print("Moving to target orientation using slow joint control...")
+        ret = self.arm.set_servo_angle(angle=joint_angles, speed=1, wait=True, is_radian=True)
+        if ret != 0:
+            print(f"Failed to move to initialization pose, code: {ret}")
+            if not self.handle_error(ret, "initialize_tcp_orientation"):
+                print("Initialization pose failed")
+        else:
+            print("Successfully moved to initialization pose")
+        
+        time.sleep(2.0)  # Allow time for movement to complete
+        
+        # Verify final orientation
+        code, final_pos = self.arm.get_position(is_radian=True)
+        if code == 0:
+            final_orientation = final_pos[3:6]
+            orientation_error = [abs(final_orientation[i] - target_orientation[i]) for i in range(3)]
+            max_error = max(orientation_error)
+            if max_error < 0.05:  # < 2.9 degrees
+                print(f"✅ TCP orientation initialization successful")
+                print(f"  Final orientation (rad): roll={final_orientation[0]:.3f}, pitch={final_orientation[1]:.3f}, yaw={final_orientation[2]:.3f}")
+            else:
+                print(f"⚠️ TCP orientation initialization completed with error: {max_error:.3f} rad ({max_error*180/3.14159:.1f} deg)")
+        else:
+            print("Could not verify final orientation")
     
     def handle_error(self, ret, operation=""):
         """Handle common error codes"""
@@ -228,6 +300,10 @@ def fetch_init_poses():
     init_controller_position = frame_1_to_2 @ pose_matrix[:3, 3]
     init_eef_pos = xarm.get_eef_position()
     
+    # Use actual controller orientation at startup as reference
+    init_ori_in_1 = pose_matrix[:3, :3]  # Real controller orientation in VR frame
+    init_ori_in_2 = frame_1_to_2 @ init_ori_in_1  # Transform to robot frame
+    
     code = 1
     while code != 0:
         code, init_jangs = xarm.arm.get_servo_angle(is_radian=True)
@@ -247,39 +323,25 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
     if dummy_ori:
         rpy = np.array([np.pi, 0, 0])
     else:
+        # DIRECT ABSOLUTE ORIENTATION MAPPING with coordinate transformation
+        
         # Get current controller orientation in VR base frame
         curr_ori_in_1 = pose_matrix[:3, :3]
         
         # Transform current controller orientation to robot base frame
         curr_ori_in_2 = frame_1_to_2 @ curr_ori_in_1
         
-        # SIMPLE APPROACH: Only map controller Y rotation to TCP Z rotation
-        # Controller Y-axis points down in natural grip
-        # TCP Z-axis points down in standard pose
+        # Get the initial controller orientation reference in robot frame  
+        # This represents the controller orientation when robot was initialized
+        init_controller_ori_in_2 = frame_1_to_2 @ init_ori_in_1
         
-        # Get current and initial controller Y axes in robot frame
-        curr_y_axis = curr_ori_in_2[:, 1]  # Controller Y axis
-        init_y_axis = init_ori_in_2[:, 1]  # Initial controller Y axis
+        # Calculate the relative rotation from initial controller orientation
+        rel_controller_rotation = init_controller_ori_in_2.T @ curr_ori_in_2
         
-        # Calculate CHANGE in rotation since last frame (not absolute)
-        if 'prev_controller_ori' not in globals():
-            global prev_controller_ori
-            prev_controller_ori = curr_ori_in_2
-            y_rotation_change = 0  # No change on first frame
-        else:
-            # Calculate relative rotation between current and previous frame
-            rel_rotation = prev_controller_ori.T @ curr_ori_in_2
-            
-            # Extract Y-axis rotation change from rotation matrix
-            # For small rotations, the Y-rotation is approximately the (0,2) element
-            y_rotation_change = np.arctan2(rel_rotation[0, 2], rel_rotation[0, 0])
-            
-            # Update previous orientation
-            prev_controller_ori = curr_ori_in_2
-            
-        # SIMPLE RELATIVE MAPPING: Just map controller changes to TCP changes
+        # Get the robot's initial TCP orientation (from initialization)
+        init_tcp_orientation = np.array([3.136, 0.000, 0.000])  # [roll, pitch, yaw] in radians
         
-        # Get current TCP pose as starting point
+        # Get current TCP pose for both position and orientation
         code, current_tcp_pose = xarm.arm.get_position(is_radian=True)
         if code == 0:
             current_tcp_pos = np.array(current_tcp_pose[:3]) / 1000  # mm to meters
@@ -288,21 +350,28 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
             # Skip this iteration if we can't read current pose
             return None, None, None, None
         
-        # Controller Y rotation change → TCP yaw change (1:1 mapping, already small)
-        tcp_yaw_change = y_rotation_change  # Direct frame-to-frame change
+        # SIMPLE ABSOLUTE MAPPING: Controller local Y-axis rotation → TCP yaw (Z-axis rotation)
+        # Controller local Y-axis = [0,0,1] in VR frame (global Z direction)
+        # When user twists controller around its local Y-axis → TCP yaws
         
-        # Apply the change to current TCP orientation
-        rpy = [current_rpy[0],                    # Keep current roll
-               current_rpy[1],                    # Keep current pitch  
-               current_rpy[2] + tcp_yaw_change]   # Add yaw change
+        # Extract rotation around Y-axis (twist motion) from controller orientation
+        # Get relative rotation from initial to current controller orientation
+        rel_controller_rotation = init_controller_ori_in_2.T @ curr_ori_in_2
         
-        # Debug
-        if abs(tcp_yaw_change) > 0.001:  # > 0.057 degrees
-            print(f"\n[YAW CHANGE] Controller Y: {y_rotation_change*180/np.pi:.3f}° -> TCP yaw: +{tcp_yaw_change*180/np.pi:.3f}°", end="")
+        # Extract Y-axis rotation (twist) from rotation matrix
+        # This is the same method as original but made absolute instead of relative
+        y_axis_rotation = np.arctan2(rel_controller_rotation[0, 2], rel_controller_rotation[0, 0])
         
+        # Map controller Y-axis rotation (twist) directly to TCP yaw offset
+        absolute_yaw_offset = y_axis_rotation
         
-        # Debug print
-        print(f"\rController Y change: {y_rotation_change*180/np.pi:.3f}° -> TCP Yaw change: {tcp_yaw_change*180/np.pi:.3f}° | TCP RPY: [{current_rpy[0]*180/np.pi:.0f}°, {current_rpy[1]*180/np.pi:.0f}°, {current_rpy[2]*180/np.pi:.0f}°]", end="")
+        # Apply to initial TCP orientation (keep roll and pitch from initialization)
+        rpy = [init_tcp_orientation[0],                              # Keep initial roll
+               init_tcp_orientation[1],                              # Keep initial pitch  
+               init_tcp_orientation[2] + absolute_yaw_offset]        # Absolute yaw mapping
+        
+        # Debug print - show controller local Y-axis (VR global Z) rotation and TCP yaw
+        print(f"\rController twist (local Y/global Z): {absolute_yaw_offset*180/np.pi:.1f}° -> TCP Yaw: {rpy[2]*180/np.pi:.1f}° | TCP RPY: [{rpy[0]*180/np.pi:.1f}°, {rpy[1]*180/np.pi:.1f}°, {rpy[2]*180/np.pi:.1f}°]", end="")
 
     # Apply RPY mask to disable certain rotations if needed
     if not dummy_ori and not rpy_mask[0]:
@@ -315,28 +384,19 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
     if dummy_pos:
         rel_vr_pos = init_eef_pos + np.array([duration/control_freq, 0, 0])
     else:
-        # Frame-to-frame position mapping: track position changes between frames
-        curr_pos_in_1 = pose_matrix[:3, 3]
-        curr_pos_in_2 = frame_1_to_2 @ curr_pos_in_1
+        # Relative position mapping: track position changes from initial position
+        curr_pos_in_1 = pose_matrix[:3, 3]  # Current controller position in VR frame
+        curr_pos_in_2 = frame_1_to_2 @ curr_pos_in_1  # Transform to robot base frame
         
-        # Track controller position change since last frame (not since start)
-        if 'prev_controller_pos' not in globals():
-            global prev_controller_pos
-            prev_controller_pos = curr_pos_in_2
-            controller_pos_change = np.array([0, 0, 0])  # No change on first frame
-        else:
-            # Calculate position change since last frame
-            controller_pos_change = curr_pos_in_2 - prev_controller_pos
-            # Update previous position
-            prev_controller_pos = curr_pos_in_2
+        # Calculate controller movement relative to initial position (in robot base frame)
+        controller_offset = curr_pos_in_2 - init_controller_position
         
-        # Apply small movement to current TCP position (scale down for safety)
-        tcp_pos_change = controller_pos_change * 0.5  # 50% of controller movement per frame
-        desired_eef_pos = current_tcp_pos + tcp_pos_change
+        # Apply controller offset to initial TCP position (1:1 mapping in robot base frame)
+        desired_eef_pos = init_eef_pos + controller_offset
         
         # Debug position changes
-        if np.linalg.norm(tcp_pos_change) > 0.001:  # > 1mm change
-            print(f"\n[POS CHANGE] Controller: [{controller_pos_change[0]*1000:.1f}, {controller_pos_change[1]*1000:.1f}, {controller_pos_change[2]*1000:.1f}]mm -> TCP: [{tcp_pos_change[0]*1000:.1f}, {tcp_pos_change[1]*1000:.1f}, {tcp_pos_change[2]*1000:.1f}]mm", end="")
+        if np.linalg.norm(controller_offset) > 0.001:  # > 1mm change
+            print(f"\n[POS CHANGE] Controller offset: [{controller_offset[0]*1000:.1f}, {controller_offset[1]*1000:.1f}, {controller_offset[2]*1000:.1f}]mm -> TCP: [{desired_eef_pos[0]*1000:.1f}, {desired_eef_pos[1]*1000:.1f}, {desired_eef_pos[2]*1000:.1f}]mm", end="")
 
         Kp_jang =  0.1
         Ki_jang =  0.4 * 16
@@ -540,8 +600,14 @@ def robot_control_xarmapi(control_mode="joint_vel", use_position_pid=True, use_j
                     print("Emergency stop triggered!")
                     break
                 elif code == 1:
+                    print("Code 1 error - Motion blocked/Emergency stop! Stopping for safety.")
+                    print(f"Last target pose: pos={eef_pos_target*1000}, rpy={np.array(rpy)*180/np.pi}")
+                    # Immediately stop and reset robot
+                    xarm.arm.set_state(state=4)  # Set to PAUSED state
                     break
-                continue
+                else:
+                    print(f"Unknown error code {code}, stopping for safety")
+                    break
             else:
                 print(f" -> SUCCESS", end="")
 
@@ -619,7 +685,7 @@ if __name__ == "__main__":
             ip="192.168.1.226", 
             mode=mode,
             simulated=simulated,
-            tcp_z_offset=260
+            tcp_z_offset=218
         )
         print("xArm initialized successfully")
         
