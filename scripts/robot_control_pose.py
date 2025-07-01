@@ -359,9 +359,9 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
         z_axis_rotation = np.arctan2(rel_controller_rotation[0, 1], rel_controller_rotation[0, 0])
         
         # Apply relative changes to initial TCP orientation
-        rpy = [init_tcp_orientation[0] + z_axis_rotation*0.1,     # Roll: around X-axis
-               init_tcp_orientation[1] + x_axis_rotation*0.1,  # Pitch: around Y-axis  
-               init_tcp_orientation[2] + y_axis_rotation_pitch*0.1]     # Yaw: around Z-axis (original working method)
+        rpy = [init_tcp_orientation[0] + z_axis_rotation*0.15,     # Roll: around X-axis
+               init_tcp_orientation[1] + x_axis_rotation*0.15,  # Pitch: around Y-axis  
+               init_tcp_orientation[2] + y_axis_rotation_pitch*0.15]     # Yaw: around Z-axis (original working method)
         
         # Debug print - show all orientation mappings
         print(f"\rController RPY: R={x_axis_rotation*180/np.pi:.1f}° P={y_axis_rotation_pitch*180/np.pi:.1f}° Y={z_axis_rotation*180/np.pi:.1f}° -> TCP RPY: [{rpy[0]*180/np.pi:.1f}°, {rpy[1]*180/np.pi:.1f}°, {rpy[2]*180/np.pi:.1f}°]", end="")
@@ -385,7 +385,7 @@ def get_eef_target_pos_ori(use_position_pid=False, ema_smooth_pos=False, use_jan
         controller_offset = curr_pos_in_2 - init_controller_position
         
         # Apply controller offset to initial TCP position (1:1 mapping in robot base frame)
-        desired_eef_pos = init_eef_pos + controller_offset * 0.1  # Scale position changes by 0.5
+        desired_eef_pos = init_eef_pos + controller_offset * 0.15  # Scale position changes by 0.5
         
         # Debug position changes
         if np.linalg.norm(controller_offset) > 0.001:  # > 1mm change
